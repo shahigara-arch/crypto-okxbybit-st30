@@ -1,4 +1,4 @@
-# crypto_okxbybit_st30.py — OKX/Bybit 30m ST+MACD with Hidden Strength Add-ons
+# crypto_okxbybit_st30.py — OKX/Bybit 30m ST+MACD with Hidden Strength Add-ons (fixed)
 import os, time, html, requests, datetime as dt, sys, traceback
 import numpy as np
 import pandas as pd
@@ -6,9 +6,8 @@ import pandas as pd
 # ---------- Config ----------
 TOP_N = 100
 INTERVAL_MIN = 30
-MTF_INTERVAL = "4H"   # OKX format; Bybit uses 240 minutes
 MIN_PRICE = 0.05
-MIN_QVOL = 10_000_000.0   # 24h quote volume USD (lower if too strict)
+MIN_QVOL = 10_000_000.0  # 24h quote volume USD
 TIMEOUT = 20
 RETRIES = 3
 THROTTLE = 0.03
@@ -111,6 +110,9 @@ def norm01(x, lo, hi):
     if hi == lo: return 0.0
     return float(max(0.0, min(1.0, (x - lo)/(hi - lo))))
 
+def tv_link(sym):
+    return f"https://www.tradingview.com/chart/?symbol={TV_PREFIX}:{sym.replace('-', '')}&interval={INTERVAL_MIN}"
+
 # ---------- OKX ----------
 def okx_top_usdt(top_n=100):
     j = get_json("https://www.okx.com/api/v5/market/tickers", params={"instType":"SPOT"})
@@ -139,7 +141,6 @@ def okx_klines(inst, bar="30m", limit=300):
         df[c] = df[c].astype(float)
     df["open_time_dt"] = pd.to_datetime(df["ts"].astype(np.int64), unit="ms", utc=True)
     df = df.sort_values("open_time_dt").reset_index(drop=True)
-    # OKX candles are end times descending; but we sorted by open
     return df
 
 def okx_depth(inst, sz=20):
@@ -160,22 +161,18 @@ def okx_depth(inst, sz=20):
     return imb
 
 def okx_swap_metrics(inst_spot):
-    # Convert BTC-USDT -> BTC-USDT-SWAP
     base = inst_spot.split("-")[0]
     inst = f"{base}-USDT-SWAP"
-    # OI
     oi = None; fund = None
     try:
         j1 = get_json("https://www.okx.com/api/v5/public/open-interest", params={"instType":"SWAP", "instId":inst})
         d1 = (j1.get("data") or [])
-        if d1:
-            oi = float(d1[0].get("oi") or 0.0)
+        if d1: oi = float(d1[0].get("oi") or 0.0)
     except Exception: pass
     try:
         j2 = get_json("https://www.okx.com/api/v5/public/funding-rate", params={"instId":inst})
         d2 = (j2.get("data") or [])
-        if d2:
-            fund = float(d2[0].get("fundingRate") or 0.0)  # typically 0.0001
+        if d2: fund = float(d2[0].get("fundingRate") or 0.0)
     except Exception: pass
     return oi, fund
 
@@ -202,7 +199,6 @@ def bybit_klines(symbol, minutes=30, limit=300):
     interval = str(minutes)
     j = get_json("https://api.bybit.com/v5/market/kline", params={"category":"spot","symbol":symbol,"interval":interval,"limit":limit})
     arr = ((j.get("result") or {}).get("list") or [])
-    # list: [start, open, high, low, close, volume, turnover]
     df = pd.DataFrame(arr, columns=["start","open","high","low","close","volume","turnover"])
     if df.empty: return df
     for c in ["open","high","low","close","volume"]: df[c] = df[c].astype(float)
@@ -224,7 +220,6 @@ def bybit_depth(symbol, limit=50):
     return (bq - aq)/(bq + aq)
 
 def bybit_linear_metrics(symbol_spot):
-    # spot BTCUSDT -> linear perp BTCUSDT
     oi = None; fund = None
     try:
         j = get_json("https://api.bybit.com/v5/market/tickers", params={"category":"linear","symbol":symbol_spot})
@@ -238,7 +233,7 @@ def bybit_linear_metrics(symbol_spot):
 
 # ---------- News (CryptoPanic, optional) ----------
 def news_score(base):
-    token = os.environ.get("CRYPTOPANIC_TOKEN","" ).strip()
+    token = os.environ.get("CRYPTOPANIC_TOKEN","").strip()
     if not token: return None
     try:
         j = get_json("https://cryptopanic.com/api/v1/posts/", params={
@@ -252,18 +247,27 @@ def news_score(base):
         pos = neg = 0
         for r in results[:20]:
             votes = r.get("votes") or {}
-            pos += int(votes.get("positive",0))
-            neg += int(votes.get("negative",0))
+            pos += int(votes.get("positive",0)); neg += int(votes.get("negative",0))
         if pos+neg == 0: return 0.0
         score = (pos - neg) / max(1, pos + neg)  # -1..+1
         return max(0.0, min(1.0, 0.5 + 0.5*score))  # 0..1
     except Exception:
         return None
 
-# ---------- Helpers ----------
-def tv_link(sym):
-    return f"https://www.tradingview.com/chart/?symbol={TV_PREFIX}:{sym.replace('-', '')}&interval={INTERVAL_MIN}"
+# ---------- State (no-duplicate per bar) ----------
+STATE_FILE = "last_bar_30m.txt"
+def read_last_bar_ts():
+    try:
+        return int(open(STATE_FILE,"r").read().strip())
+    except Exception:
+        return None
+def write_last_bar_ts(ts):
+    try:
+        with open(STATE_FILE,"w") as f: f.write(str(ts))
+    except Exception as e:
+        log("state write err:", e)
 
+# ---------- Scanner ----------
 def scan_symbol(sym, qmap):
     # 30m candles
     if SRC == "okx":
@@ -271,6 +275,7 @@ def scan_symbol(sym, qmap):
     else:
         df = bybit_klines(sym, minutes=INTERVAL_MIN, limit=400)
     if df is None or df.empty or len(df) < 120: return None
+
     i = len(df) - 2  # last closed bar
     close = df["close"].values; high = df["high"].values; low = df["low"].values; vol = df["volume"].values
 
@@ -280,4 +285,240 @@ def scan_symbol(sym, qmap):
 
     st_buy  = (tr[i] == 1 and tr[i-1] == -1)
     st_sell = (tr[i] == -1 and tr[i-1] == 1)
-    macd_up = (m[i-1] <= s
+    macd_up = (m[i-1] <= s[i-1]) and (m[i] > s[i])
+    macd_dn = (m[i-1] >= s[i-1]) and (m[i] < s[i])
+
+    if not ((st_buy and macd_up) or (st_sell and macd_dn)):
+        return None
+
+    # Relative volume (20-bars)
+    rv = np.nan
+    if i >= 21:
+        avg20 = np.mean(vol[i-20:i])
+        rv = vol[i] / avg20 if avg20 > 0 else np.nan
+
+    # Breakout proximity (55 bars)
+    hh = np.max(close[max(0, i-55):i+1]); ll = np.min(close[max(0, i-55):i+1])
+    if st_buy:
+        bo = 1.0 - max(0.0, (hh - close[i]) / (0.01*close[i]))  # within 1% → close to 1
+    else:
+        bo = 1.0 - max(0.0, (close[i] - ll) / (0.01*close[i]))
+    bo = max(0.0, min(1.0, bo))
+
+    # Candle quality
+    rng = max(1e-12, high[i]-low[i])
+    near_high = (close[i]-low[i])/rng
+    near_low  = (high[i]-close[i])/rng
+    cndl = near_high if st_buy else near_low
+    cndl = max(0.0, min(1.0, cndl))
+
+    # MTF 4h trend
+    if SRC == "okx":
+        df4 = okx_klines(sym, bar="4H", limit=300)
+    else:
+        df4 = bybit_klines(sym, minutes=240, limit=300)
+    c4 = df4["close"].values if not df4.empty else np.array([])
+    mtf = False
+    if len(c4) >= 200:
+        ema50 = ema(c4, 50); ema200 = ema(c4, 200)
+        m4, s4, h4 = macd(c4, 12, 26, 9)
+        j = len(c4)-1
+        if st_buy:
+            mtf = (c4[j] > ema50[j] > ema200[j]) and (h4[j] > 0)
+        else:
+            mtf = (c4[j] < ema50[j] < ema200[j]) and (h4[j] < 0)
+
+    # Orderbook imbalance
+    try:
+        ob_imb = okx_depth(sym, 20) if SRC=="okx" else bybit_depth(sym, 50)
+    except Exception:
+        ob_imb = None
+    if ob_imb is None:
+        ob_sig = 0.5
+    else:
+        ob_sig = ob_imb if st_buy else -ob_imb
+        ob_sig = max(-1.0, min(1.0, ob_sig))
+        ob_sig = 0.5 + 0.5*ob_sig  # 0..1
+
+    # Futures confluence (SWAP/linear)
+    oi = None; fund = None
+    try:
+        oi, fund = (okx_swap_metrics(sym) if SRC=="okx" else bybit_linear_metrics(sym.replace("-", "")))
+    except Exception:
+        pass
+
+    # Bar identity (use open_time of last closed)
+    bar_close_ms = int(df.iloc[i]["open_time_dt"].value/1e6) if "open_time_dt" in df else 0
+
+    return {
+        "symbol": sym,
+        "side": "BUY" if st_buy else "SELL",
+        "price": float(close[i]),
+        "rvol": float(rv) if rv==rv else None,
+        "adx":  float(adx30[i]) if adx30[i]==adx30[i] else None,
+        "bo":   bo,
+        "cndl": cndl,
+        "mtf":  bool(mtf),
+        "ob":   float(ob_sig) if ob_sig is not None else 0.5,
+        "qvol": float(qmap.get(sym, 0.0)),
+        "oi":   oi,
+        "fund": fund,
+        "bar_close_ms": bar_close_ms,
+    }
+
+def news_score(base):
+    token = os.environ.get("CRYPTOPANIC_TOKEN","").strip()
+    if not token: return None
+    try:
+        j = get_json("https://cryptopanic.com/api/v1/posts/", params={
+            "auth_token": token,
+            "currencies": base,
+            "kind": "news",
+            "filter": "rising",
+            "public": "true",
+        })
+        results = j.get("results") or []
+        pos = neg = 0
+        for r in results[:20]:
+            votes = r.get("votes") or {}
+            pos += int(votes.get("positive",0)); neg += int(votes.get("negative",0))
+        if pos+neg == 0: return 0.0
+        score = (pos - neg) / max(1, pos + neg)
+        return max(0.0, min(1.0, 0.5 + 0.5*score))
+    except Exception:
+        return None
+
+def add_news_and_score(rows):
+    oi_vals = [r["oi"] for r in rows if r.get("oi") is not None and r.get("oi")==r.get("oi")]
+    oi_min = min(oi_vals) if oi_vals else 0.0
+    oi_max = max(oi_vals) if oi_vals else 1.0
+    out = []
+    for r in rows:
+        base = r["symbol"].split("-")[0] if SRC=="okx" else r["symbol"].replace("USDT","")
+        nscore = news_score(base)  # 0..1 or None
+
+        rv_n   = norm01(r.get("rvol"), 1.0, 3.0)
+        adx_n  = norm01(r.get("adx"),  15.0, 35.0)
+        mtf_n  = 1.0 if r.get("mtf") else 0.0
+        bo_n   = r.get("bo") or 0.0
+        cndl_n = r.get("cndl") or 0.0
+        ob_n   = r.get("ob") or 0.5
+        oi_raw = r.get("oi")
+        oi_n   = 0.0
+        if oi_vals:
+            oi_n = norm01(oi_raw if oi_raw is not None else oi_min, oi_min, oi_max)
+
+        fund = r.get("fund")
+        fund_n = 0.5
+        if fund is not None:
+            if r["side"] == "BUY":
+                fund_n = max(0.0, min(1.0, 0.5 + (-min(fund, 0.01))/0.02))
+            else:
+                fund_n = max(0.0, min(1.0, 0.5 + (min(max(fund,0.0),0.01))/0.02))
+
+        news_n = nscore if nscore is not None else 0.5
+
+        score = 100.0 * (
+            0.25*rv_n + 0.20*adx_n + 0.20*mtf_n + 0.10*bo_n +
+            0.05*cndl_n + 0.10*ob_n + 0.05*oi_n + 0.05*fund_n
+        )
+        score += 5.0 * (news_n - 0.5)
+
+        r["score"] = float(score)
+        r["news"]  = None if nscore is None else float(nscore)
+        out.append(r)
+    return out
+
+def send_tg(text):
+    tok = os.environ.get("CRYPTO_TELEGRAM_BOT_TOKEN","").strip()
+    chat= os.environ.get("CRYPTO_TELEGRAM_CHAT_ID","").strip()
+    if not tok or not chat:
+        log("Missing Telegram creds"); return
+    try:
+        r = S.post(f"https://api.telegram.org/bot{tok}/sendMessage",
+                   data={"chat_id": chat, "text": text[:3900], "parse_mode":"HTML","disable_web_page_preview":True},
+                   timeout=TIMEOUT)
+        log("TG:", r.status_code, (r.text or "")[:160])
+    except Exception as e:
+        log("TG error:", e)
+
+def main():
+    send_tg(f"⏱️ Crypto 30m ST+MACD scan start — src={SRC.upper()}")
+    # Universe
+    if SRC == "okx":
+        syms, qmap = okx_top_usdt(TOP_N)
+    else:
+        syms, qmap = bybit_top_usdt(TOP_N)
+
+    raw = []; last_bar = None
+    for s in syms:
+        try:
+            r = scan_symbol(s, qmap)
+            if r:
+                raw.append(r); last_bar = r["bar_close_ms"]
+        except Exception as e:
+            log("scan err", s, e)
+        time.sleep(THROTTLE)
+
+    if not raw:
+        send_tg("✔️ No ST+MACD same-candle signals on 30m.")
+        return
+
+    # No-duplicate per bar
+    prev = read_last_bar_ts()
+    if last_bar is not None and prev is not None and prev == last_bar:
+        log("Duplicate bar; skipping send.")
+        return
+
+    rows = add_news_and_score(raw)
+    rows.sort(key=lambda x: x.get("score", 0.0), reverse=True)
+    top10 = rows[:10]
+
+    # Ultra filter
+    ultra = []
+    for r in rows:
+        if r.get("rvol") is None or r.get("adx") is None: continue
+        cond = (r["rvol"] >= ULTRA_MIN_RVOL) and (r["adx"] >= ULTRA_MIN_ADX) and r["mtf"]
+        if r["side"] == "BUY":
+            cond = cond and (r["bo"] >= (1.0 - ULTRA_BO_TOL)) and (r["ob"] >= ULTRA_OB_MIN)
+        else:
+            cond = cond and (r["bo"] >= (1.0 - ULTRA_BO_TOL)) and (r["ob"] <= (1.0 - ULTRA_OB_MIN))
+        if cond:
+            ultra.append(r)
+    ultra.sort(key=lambda x: x["score"], reverse=True)
+    ultra2 = ultra[:2]
+
+    ts = dt.datetime.utcnow().strftime("%d-%b %H:%M UTC")
+    lines = [f"<b>Crypto ST+MACD 30m</b> — {html.escape(ts)} — {SRC.upper()} Top {TOP_N}"]
+    if ultra2:
+        lines.append("🔥 <b>Ultra Top 2</b>")
+        for r in ultra2:
+            rv = "NA" if r.get("rvol") is None else f"{r['rvol']:.2f}x"
+            ad = "NA" if r.get("adx") is None else f"{r['adx']:.1f}"
+            ob = f"{r['ob']:.2f}"
+            nf = "-" if r.get("news") is None else f"{r['news']:.2f}"
+            lines.append(f"• {r['side']} <b>{r['symbol']}</b> @ {r['price']:.6f} | S:{r['score']:.1f} | RV:{rv} | ADX:{ad} | OB:{ob} | News:{nf} | <a href='{tv_link(r['symbol'])}'>TV</a>")
+    if top10:
+        lines.append("🏆 <b>Top 10 Strong</b>")
+        for r in top10:
+            rv = "NA" if r.get("rvol") is None else f"{r['rvol']:.2f}x"
+            ad = "NA" if r.get("adx") is None else f"{r['adx']:.1f}"
+            ob = f"{r['ob']:.2f}"
+            nf = "-" if r.get("news") is None else f"{r['news']:.2f}"
+            lines.append(f"• {r['side']} <b>{r['symbol']}</b> @ {r['price']:.6f} | S:{r['score']:.1f} | RV:{rv} | ADX:{ad} | OB:{ob} | News:{nf} | <a href='{tv_link(r['symbol'])}'>TV</a>")
+
+    send_tg("\n".join(lines))
+    if last_bar is not None:
+        write_last_bar_ts(last_bar)
+    log("Sent.")
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        tb = traceback.format_exc()
+        log("Fatal:", e); print(tb)
+        try:
+            send_tg(f"⚠️ Crypto bot error:\n<pre>{html.escape(tb[-3000:])}</pre>")
+        except Exception: pass
+        sys.exit(0)
